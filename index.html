@@ -648,6 +648,11 @@ npm create vite@latest my-app -- --template react
     <>
       <PageTitle title="🛠 React の導入 🛠" sub="自分のPCで動かすには?" />
 
+      <div className="bg-amber-100 border-4 border-amber-400 rounded-2xl p-5 mb-6 text-center">
+        <div className="text-2xl font-extrabold text-amber-800 mb-2">📚 このページは当日触りません</div>
+        <div className="text-sm text-amber-700">「あとで自分でReactを動かしたい人」のための補足ページです。<br/>当日の30分の説明には含まれていないので、興味のある方だけ後から読んでください。</div>
+      </div>
+
       <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-4 mb-6 flex items-start gap-3">
         <div className="text-2xl shrink-0">📚</div>
         <div className="text-sm text-gray-700">
@@ -1140,6 +1145,271 @@ function App() {
   );
 }
 
+// ===========================
+// FourStageEditor (JSX → JS → Element Object → 実DOM の4段同期エディタ)
+// ===========================
+function formatReactElement(node, indent) {
+  if (indent === undefined) indent = 0;
+  const pad = "  ".repeat(indent);
+  const padInner = "  ".repeat(indent + 1);
+
+  // primitive: string / number / boolean / null / undefined
+  if (node === null) return "null";
+  if (node === undefined) return "undefined";
+  if (typeof node === "string") return JSON.stringify(node);
+  if (typeof node === "number" || typeof node === "boolean") return String(node);
+  if (typeof node === "function") return "[Function: " + (node.name || "anonymous") + "]";
+
+  // array of children
+  if (Array.isArray(node)) {
+    if (node.length === 0) return "[]";
+    const items = node.map(c => padInner + formatReactElement(c, indent + 1));
+    return "[\n" + items.join(",\n") + "\n" + pad + "]";
+  }
+
+  // React element
+  if (node && typeof node === "object" && node.$$typeof) {
+    let typeStr;
+    if (typeof node.type === "string") {
+      typeStr = JSON.stringify(node.type);
+    } else if (node.type && (node.type.name || node.type.displayName)) {
+      typeStr = node.type.displayName || node.type.name;
+    } else {
+      typeStr = "Component";
+    }
+
+    // collect displayable props (skip internal keys, ref, key — show children last for readability)
+    const props = node.props || {};
+    const skipKeys = { children: true };
+    const propKeys = Object.keys(props).filter(k => !skipKeys[k] && !k.startsWith("_") && k !== "$$typeof");
+
+    const lines = [];
+    lines.push("type: " + typeStr);
+
+    const propLines = [];
+    for (let i = 0; i < propKeys.length; i++) {
+      const k = propKeys[i];
+      propLines.push("  ".repeat(indent + 2) + k + ": " + formatReactElement(props[k], indent + 2));
+    }
+    // children
+    if (props.children !== undefined) {
+      propLines.push("  ".repeat(indent + 2) + "children: " + formatReactElement(props.children, indent + 2));
+    }
+
+    let propsStr;
+    if (propLines.length === 0) {
+      propsStr = "{}";
+    } else {
+      propsStr = "{\n" + propLines.join(",\n") + "\n" + padInner + "}";
+    }
+    lines.push("props: " + propsStr);
+
+    return "{\n" + padInner + lines.join(",\n" + padInner) + "\n" + pad + "}";
+  }
+
+  // generic object (rare in this context)
+  if (typeof node === "object") {
+    const keys = Object.keys(node).filter(k => !k.startsWith("_") && k !== "$$typeof");
+    if (keys.length === 0) return "{}";
+    const items = keys.map(k => padInner + k + ": " + formatReactElement(node[k], indent + 1));
+    return "{\n" + items.join(",\n") + "\n" + pad + "}";
+  }
+  return String(node);
+}
+
+function FourStageEditor() {
+  const initial = `<div>\n  <h1>🌷 こんにちは</h1>\n  <p>水: 6回</p>\n</div>`;
+  const [jsx, setJsx] = useState(initial);
+  const [transformed, setTransformed] = useState("");
+  const [babelError, setBabelError] = useState(null);
+  const [element, setElement] = useState(null);
+  const [evalError, setEvalError] = useState(null);
+  const [renderError, setRenderError] = useState(null);
+
+  const previewHostRef = useRef(null);
+  const rootRef = useRef(null);
+
+  // debounce 300ms: JSX → Babel変換 → eval → 状態に反映
+  useEffect(() => {
+    const t = setTimeout(() => {
+      // ② Babel 変換
+      let displayCode = "";
+      try {
+        if (jsx.trim() === "") {
+          setTransformed("");
+          setBabelError(null);
+          setElement(null);
+          setEvalError(null);
+          return;
+        }
+        displayCode = Babel.transform(jsx, { presets: ["react"] }).code;
+        setTransformed(displayCode);
+        setBabelError(null);
+      } catch (e) {
+        setBabelError(e.message);
+        setTransformed("");
+        setElement(null);
+        setEvalError(null);
+        return;
+      }
+
+      // ③ Element オブジェクト化(eval)
+      try {
+        // 安全に値を得るため、JSXを括弧で包んでから変換 → 式として eval 可能に
+        const wrapped = "(\n" + jsx + "\n)";
+        const codeForEval = Babel.transform(wrapped, { presets: ["react"] }).code;
+        // 末尾セミコロン除去
+        const cleaned = codeForEval.replace(/;\s*$/, "");
+        const factory = new Function("React", "return (" + cleaned + ");");
+        const el = factory(React);
+        setElement(el);
+        setEvalError(null);
+      } catch (e) {
+        setEvalError(e.message);
+        setElement(null);
+      }
+    }, 300);
+    return () => clearTimeout(t);
+  }, [jsx]);
+
+  // ④ 実DOMプレビュー: createRoot を 1度だけ作って使いまわす
+  useEffect(() => {
+    if (previewHostRef.current && !rootRef.current) {
+      rootRef.current = ReactDOM.createRoot(previewHostRef.current);
+    }
+    return () => {
+      if (rootRef.current) {
+        const r = rootRef.current;
+        rootRef.current = null;
+        // unmount は次のtickで(同期unmount警告回避)
+        setTimeout(() => { try { r.unmount(); } catch (e) {} }, 0);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!rootRef.current) return;
+    try {
+      if (babelError || evalError || element === null || element === undefined) {
+        rootRef.current.render(null);
+        setRenderError(null);
+        return;
+      }
+      rootRef.current.render(
+        <ErrorBoundary key={Math.random()}>
+          {element}
+        </ErrorBoundary>
+      );
+      setRenderError(null);
+    } catch (e) {
+      setRenderError(e.message);
+    }
+  }, [element, babelError, evalError]);
+
+  const reset = () => setJsx(initial);
+
+  const panelHeight = 220;
+
+  return (
+    <div className="card overflow-hidden my-4">
+      <div className="flex items-center justify-between bg-amber-50 px-4 py-3 border-b-2 border-amber-200">
+        <div className="flex items-center gap-2">
+          <span className="w-3 h-3 rounded-full bg-orange-400"/>
+          <span className="w-3 h-3 rounded-full bg-amber-400"/>
+          <span className="w-3 h-3 rounded-full bg-purple-400"/>
+          <span className="w-3 h-3 rounded-full bg-emerald-400"/>
+          <span className="ml-2 text-xs font-extrabold text-amber-800">🔬 4段同期エディタ — ①を編集すると②③④が連動するよ</span>
+        </div>
+        <button onClick={reset} className="flex items-center gap-1 text-xs font-bold text-rose-500 hover:text-rose-600">
+          <Reload /> リセット
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2">
+        {/* ① JSX 入力 (orange) */}
+        <div className="border-b-2 md:border-b-2 md:border-r-2 border-orange-200 bg-orange-50 min-w-0">
+          <div className="flex items-center justify-between px-3 pt-2 pb-1">
+            <div className="text-[10px] text-orange-700 font-extrabold tracking-widest">① 書く — JSX(あなたが編集)</div>
+            <span className="text-[10px] bg-orange-200 text-orange-800 px-2 rounded-full font-bold">編集可</span>
+          </div>
+          <textarea
+            value={jsx}
+            onChange={e => setJsx(e.target.value)}
+            spellCheck={false}
+            wrap="off"
+            className="code-edit"
+            style={{ height: panelHeight + "px", background: "#FFF8F0" }}
+          />
+        </div>
+
+        {/* ② Babel 変換後 JS (amber) */}
+        <div className="border-b-2 border-amber-200 bg-amber-50 min-w-0">
+          <div className="flex items-center justify-between px-3 pt-2 pb-1">
+            <div className="text-[10px] text-amber-800 font-extrabold tracking-widest">② 変換 — Babelが書き換えたJS</div>
+            <span className="text-[10px] bg-amber-200 text-amber-800 px-2 rounded-full font-bold">読み取り専用</span>
+          </div>
+          <pre
+            className="code-edit"
+            style={{ height: panelHeight + "px", overflow: "auto", color: babelError ? "#b91c1c" : "#78350f", whiteSpace: "pre", padding: "16px", margin: 0, background: "#FFFBEB" }}
+          >
+            {babelError ? "⚠ Babelエラー\n" + babelError : (transformed || "(JSXを入力するとここに変換結果が出ます)")}
+          </pre>
+        </div>
+
+        {/* ③ React Element オブジェクト (purple) */}
+        <div className="border-r-0 md:border-r-2 border-purple-200 bg-purple-50 min-w-0">
+          <div className="flex items-center justify-between px-3 pt-2 pb-1">
+            <div className="text-[10px] text-purple-700 font-extrabold tracking-widest">③ オブジェクト — JSが返した React Element</div>
+            <span className="text-[10px] bg-purple-200 text-purple-800 px-2 rounded-full font-bold">JSオブジェクト</span>
+          </div>
+          <pre
+            className="code-edit"
+            style={{ height: panelHeight + "px", overflow: "auto", color: (babelError || evalError) ? "#b91c1c" : "#6b21a8", whiteSpace: "pre", padding: "16px", margin: 0, background: "#FAF5FF" }}
+          >
+            {babelError
+              ? "⚠ 上流(②)でエラーのため、ここは出せません"
+              : evalError
+                ? "⚠ 実行エラー\n" + evalError
+                : element === null || element === undefined
+                  ? "(空)"
+                  : formatReactElement(element)
+            }
+          </pre>
+        </div>
+
+        {/* ④ 実DOM プレビュー (emerald) */}
+        <div className="bg-emerald-50 min-w-0">
+          <div className="flex items-center justify-between px-3 pt-2 pb-1">
+            <div className="text-[10px] text-emerald-700 font-extrabold tracking-widest">④ 画面 — ReactDOMが描いた本物のDOM</div>
+            <span className="text-[10px] bg-emerald-200 text-emerald-800 px-2 rounded-full font-bold">生きてる画面</span>
+          </div>
+          <div
+            className="p-4 bg-white m-3 rounded-xl border-2 border-emerald-200"
+            style={{ minHeight: (panelHeight - 32) + "px", overflow: "auto" }}
+          >
+            {babelError ? (
+              <div className="text-xs text-rose-700 code-font">⚠ 上流(②)でエラーのため、画面は描画できません</div>
+            ) : evalError ? (
+              <div className="text-xs text-rose-700 code-font">⚠ 上流(③)でエラーのため、画面は描画できません</div>
+            ) : renderError ? (
+              <div className="text-xs text-rose-700 code-font">⚠ 描画エラー: {renderError}</div>
+            ) : null}
+            <div ref={previewHostRef} />
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-gradient-to-r from-orange-50 via-amber-50 to-emerald-50 px-4 py-2 text-[11px] text-gray-700 border-t-2 border-amber-200">
+        <strong className="text-amber-800">👉 試してみよう:</strong>
+        <code className="bg-white px-1 rounded mx-1 border border-orange-200">&lt;h1&gt;</code>を
+        <code className="bg-white px-1 rounded mx-1 border border-orange-200">&lt;h2&gt;</code>に変えてみる /
+        テキストを書き換える / 新しい <code className="bg-white px-1 rounded mx-1 border border-orange-200">&lt;p&gt;</code> を追加する
+        — ②③④が<strong>瞬時に</strong>連動します。
+      </div>
+    </div>
+  );
+}
+
 function How({ navigate }) {
   return (
     <>
@@ -1305,6 +1575,23 @@ document.body.<span className="fn">appendChild</span>(el);</pre>
               </ul>
             </div>
 
+            {/* JSX の {} 式埋め込み */}
+            <div className="bg-orange-50 border-2 border-orange-200 rounded-xl p-4 mb-3">
+              <div className="text-xs font-bold text-orange-700 mb-2">💡 JSX の中で JS の値を使う:`{}`</div>
+              <p className="text-sm text-gray-700 mb-2">
+                JSX のタグの中に <strong>{`{}`}</strong> を書くと、その中に <strong>JS の式(変数・計算・関数呼び出しなど)</strong> をそのまま埋め込めます。
+              </p>
+              <CodeBlock title="" html={`<span class="keyword">const</span> name = <span class="string">"React"</span>;
+<span class="keyword">const</span> count = <span class="num">3</span>;
+
+<span class="comment">// JSX の中で {name} {count} を使える</span>
+<span class="tag">&lt;h1&gt;</span>こんにちは、{name}さん!<span class="tag">&lt;/h1&gt;</span>
+<span class="tag">&lt;p&gt;</span>いいね数:{count + <span class="num">1</span>}<span class="tag">&lt;/p&gt;</span>`} />
+              <p className="text-xs text-gray-600 mt-2">
+                Tulip アプリでも <code className="bg-white px-1 rounded">{`{water}`}</code> や <code className="bg-white px-1 rounded">{`{plant}`}</code> で State の値を表示するのに使われています。
+              </p>
+            </div>
+
             {/* JSXファイル */}
             <div className="bg-white border-2 border-orange-200 rounded-xl p-4 mb-3">
               <div className="text-xs font-bold text-orange-700 mb-2">📁 どこに書く?</div>
@@ -1412,6 +1699,81 @@ document.body.<span className="fn">appendChild</span>(el);</pre>
             <div className="bg-orange-50 border-2 border-orange-200 rounded-xl p-3 text-sm text-gray-700">
               <strong>🌐 最終的に画面に出るまでの流れ:</strong><br/>
               <code className="bg-white px-1 rounded">main.jsx</code> → <code className="bg-white px-1 rounded">{`<Hello />`}</code> をレンダー → Hello の中の <code className="bg-white px-1 rounded">{`<Tulip />`}</code> も連鎖的に画面に出る
+            </div>
+
+            {/* Props */}
+            <div className="bg-orange-50 border-2 border-orange-200 rounded-xl p-4 mb-3 mt-4">
+              <div className="text-xs font-bold text-orange-700 mb-2">📦 Props:親から子へ値を渡す</div>
+              <p className="text-sm text-gray-700 mb-2">
+                コンポーネントには <strong>値を渡せます</strong>。HTML の属性のように書くだけ。
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-2">
+                <div className="bg-white border-2 border-orange-200 rounded-lg p-3">
+                  <div className="text-[10px] font-bold text-orange-700 mb-1">📤 使う側(親)</div>
+                  <pre className="code-block code-font text-xs"><span className="tag">&lt;Tulip</span> stage=<span className="string">"🌷"</span> <span className="tag">/&gt;</span>
+<span className="tag">&lt;Tulip</span> stage=<span className="string">"🌿"</span> <span className="tag">/&gt;</span></pre>
+                </div>
+                <div className="bg-white border-2 border-orange-200 rounded-lg p-3">
+                  <div className="text-[10px] font-bold text-orange-700 mb-1">📥 受け取る側(子)</div>
+                  <pre className="code-block code-font text-xs"><span className="keyword">function</span> <span className="fn">Tulip</span>(<span className="keyword">props</span>) {'{'}
+  <span className="keyword">return</span> <span className="tag">&lt;span&gt;</span>{`{props.stage}`}<span className="tag">&lt;/span</span><span className="tag">&gt;</span>;
+{'}'}</pre>
+                </div>
+              </div>
+              <p className="text-xs text-gray-600 mt-2">
+                💡 受け取る引数は <code className="bg-white px-1 rounded">props</code> という1つのオブジェクト。よく <code className="bg-white px-1 rounded">{`{ stage }`}</code> のように<strong>分割代入</strong>で書きます:<code className="bg-white px-1 rounded">{`function Tulip({ stage })`}</code>
+              </p>
+            </div>
+
+            {/* children */}
+            <div className="bg-orange-50 border-2 border-orange-200 rounded-xl p-4 mb-3">
+              <div className="text-xs font-bold text-orange-700 mb-2">👶 children:タグの中身を渡す特別な Prop</div>
+              <p className="text-sm text-gray-700 mb-2">
+                タグの<strong>開きと閉じの間</strong>に書いた内容は、自動的に <code className="bg-white px-1 rounded">props.children</code> として渡されます。
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="bg-white border-2 border-orange-200 rounded-lg p-3">
+                  <div className="text-[10px] font-bold text-orange-700 mb-1">📤 使う側</div>
+                  <pre className="code-block code-font text-xs"><span className="tag">&lt;Card&gt;</span>
+  <span className="tag">&lt;h1&gt;</span>🌷<span className="tag">&lt;/h1&gt;</span>
+<span className="tag">&lt;/Card&gt;</span></pre>
+                </div>
+                <div className="bg-white border-2 border-orange-200 rounded-lg p-3">
+                  <div className="text-[10px] font-bold text-orange-700 mb-1">📥 受け取る側</div>
+                  <pre className="code-block code-font text-xs"><span className="keyword">function</span> <span className="fn">Card</span>({'{ children }'}) {'{'}
+  <span className="keyword">return</span> <span className="tag">&lt;div&gt;</span>{'{children}'}<span className="tag">&lt;/div&gt;</span>;
+{'}'}</pre>
+                </div>
+              </div>
+            </div>
+
+            {/* Fragment */}
+            <div className="bg-orange-50 border-2 border-orange-200 rounded-xl p-4 mb-3">
+              <div className="text-xs font-bold text-orange-700 mb-2">🪡 複数の要素を返したい時:Fragment(<code className="bg-white px-1 rounded">{`<>...</>`}</code>)</div>
+              <p className="text-sm text-gray-700 mb-2">
+                関数コンポーネントの <code className="bg-white px-1 rounded">return</code> は<strong>1つの要素しか返せません</strong>。複数並べたい時は <code className="bg-white px-1 rounded">{`<>...</>`}</code>(Fragment)で囲みます。
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="bg-white border-2 border-red-200 rounded-lg p-3">
+                  <div className="text-[10px] font-bold text-red-700 mb-1">❌ エラーになる</div>
+                  <pre className="code-block code-font text-xs"><span className="keyword">return</span> (
+  <span className="tag">&lt;h1&gt;</span>...<span className="tag">&lt;/h1&gt;</span>
+  <span className="tag">&lt;p&gt;</span>...<span className="tag">&lt;/p&gt;</span>
+);</pre>
+                </div>
+                <div className="bg-white border-2 border-emerald-200 rounded-lg p-3">
+                  <div className="text-[10px] font-bold text-emerald-700 mb-1">✅ Fragment で囲む</div>
+                  <pre className="code-block code-font text-xs"><span className="keyword">return</span> (
+  <span className="tag">&lt;&gt;</span>
+    <span className="tag">&lt;h1&gt;</span>...<span className="tag">&lt;/h1&gt;</span>
+    <span className="tag">&lt;p&gt;</span>...<span className="tag">&lt;/p&gt;</span>
+  <span className="tag">&lt;/&gt;</span>
+);</pre>
+                </div>
+              </div>
+              <p className="text-xs text-gray-600 mt-2">
+                💡 <code className="bg-white px-1 rounded">{`<>`}</code> は<strong>「見えないラッパー」</strong>。実DOMには出ません。<code className="bg-white px-1 rounded">{`<div>`}</code>で囲むと余計なタグが出るのを避けたい時に使う。
+              </p>
             </div>
       </div>
 
@@ -1536,6 +1898,9 @@ React.<span class="fn">createElement</span>(<span class="fn">Tulip</span>, { sta
                   </ul>
 
                   <div className="mt-3 pt-3 border-t border-amber-200">
+                    <div className="bg-amber-50 border-2 border-amber-300 rounded-full px-4 py-1 inline-block text-xs font-bold text-amber-700 mb-2 mt-2">
+                      📖 詳しく知りたい人へ(当日はスキップ)
+                    </div>
                     <div className="text-xs font-bold text-amber-800 mb-2">🌷 Tulipコンポーネントの場合の変換:</div>
 
                     <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3">
@@ -1659,7 +2024,7 @@ React.createElement("span", null, "🌷")
             <h4 className="font-extrabold text-purple-700 mt-5 mb-2">🤔 なぜ「オブジェクト」という中間段階が必要?</h4>
             <ul className="space-y-1.5 text-sm text-gray-700 mb-3">
               <li className="flex gap-2"><span className="text-purple-600 font-bold">▸</span><span><strong>比較できるから</strong>:画面の状態(後で出てくる<strong>State</strong>)が変わると、新しい React Element がまた作られて、前のものと比較される(これがVirtual DOM の差分検出。後で出てきます)</span></li>
-              <li className="flex gap-2"><span className="text-purple-600 font-bold">▸</span><span><strong>実DOMを直接触らないから速い</strong>:JS のオブジェクト操作は、ブラウザのDOM操作より圧倒的に速い</span></li>
+              <li className="flex gap-2"><span className="text-purple-600 font-bold">▸</span><span><strong>必要最小限のDOM操作に絞れる</strong>:実DOM 操作は重い処理(再描画・レイアウト計算)が伴うことが多く、毎回全部書き換えると重い。Virtual DOM(JSのオブジェクト)を使うと、まず軽い JS の比較で「どこが変わったか」だけ計算し、必要な実DOM 操作だけに絞れる。だから「JS が速い」ではなく「必要最小限の DOM 操作に絞れる」のがポイント</span></li>
               <li className="flex gap-2"><span className="text-purple-600 font-bold">▸</span><span><strong>Web以外でも使える</strong>:同じ「設計図」でモバイルアプリ(React Native)やデスクトップアプリも作れる</span></li>
               <li className="flex gap-2"><span className="text-purple-600 font-bold">▸</span><span><strong>「どんな画面にしたいか」だけ書ける</strong>:画面更新の手順を書く必要なし。Reactが「こう変えたいのね」と察してDOM操作してくれる</span></li>
               <li className="flex gap-2"><span className="text-purple-600 font-bold">▸</span><span><strong>サーバでも先に作れる(SSR)</strong>:設計図はJSオブジェクトなので、サーバ(Node.js)でもReactを動かせる。完成HTMLを先に作ってブラウザに送れば、表示が速い・SEOにも強い(Next.jsが標準対応)</span></li>
@@ -2054,6 +2419,31 @@ container.<span class="fn">appendChild</span>(el);                <span class="c
             </div>
       </div>
 
+      {/* しくみ体感ラボ: 4段同期エディタ */}
+      <div className="card p-6 mb-8 bg-gradient-to-br from-orange-50 via-amber-50 to-purple-50 border-4 border-amber-300">
+        <div className="text-center mb-4">
+          <div className="inline-block bg-amber-100 border-2 border-amber-400 text-amber-800 px-4 py-1 rounded-full font-extrabold text-sm">
+            🎮 しくみ体感ラボ
+          </div>
+          <h3 className="text-2xl font-extrabold text-amber-800 mt-3">
+            ✨ JSX → JS → オブジェクト → DOM の旅
+          </h3>
+          <p className="text-sm text-gray-700 mt-2">
+            ここまでの①〜⑤を <strong>1つの装置</strong> で全部つないでみました。<br/>
+            左上の JSX を編集すると、3つの段階すべてが<strong>リアルタイムで連動</strong>します。<br/>
+            これが「魔法じゃない、ただの変換チェーン」の正体です。
+          </p>
+        </div>
+        <FourStageEditor />
+        <div className="bg-white border-2 border-amber-200 rounded-xl p-3 mt-3 text-xs text-gray-700">
+          <strong className="text-amber-700">🧭 4つのパネルの読み方:</strong><br/>
+          <span className="inline-block bg-orange-100 text-orange-700 px-1.5 rounded font-bold mr-1">①</span> あなたが書く JSX →
+          <span className="inline-block bg-amber-100 text-amber-700 px-1.5 rounded font-bold mx-1">②</span> Babel がただの JS に変換 →
+          <span className="inline-block bg-purple-100 text-purple-700 px-1.5 rounded font-bold mx-1">③</span> JS を実行 → React Element(オブジェクト)が返る →
+          <span className="inline-block bg-emerald-100 text-emerald-700 px-1.5 rounded font-bold mx-1">④</span> ReactDOM がオブジェクトを実 DOM に変換
+        </div>
+      </div>
+
       {/* 橋渡し */}
       <div className="card p-5 mb-4 border-dashed">
         <div className="flex items-start gap-3">
@@ -2275,9 +2665,62 @@ React:「中身があるから引数の 0 は無視!」
                   だから React には <strong>「useState は if や for の中で呼んじゃダメ」</strong> というルールがあります(順番がズレると引き出しを取り違えるから)。
                 </div>
 
-                <p className="text-[11px] text-gray-600 mt-2">
-                  ⚙ <strong>豆知識:</strong> 厳密にはこの「ロッカー」を Fiber(ファイバー)と呼びます。React 内部のコンポーネントごとの管理データのこと。
-                </p>
+                {/* 専門的な裏付け */}
+                <div className="bg-white border-2 border-purple-300 rounded-lg p-3 mt-3 text-[11px] text-gray-700">
+                  <div className="bg-amber-50 border-2 border-amber-300 rounded-full px-4 py-1 inline-block text-xs font-bold text-amber-700 mb-2">📖 詳しく知りたい人へ</div>
+                  <br/>
+                  <strong className="text-purple-700">🔬 もう少し専門的に:React 内部で何が起きているか</strong>
+
+                  <p className="mt-2 mb-2">
+                    メタファーを技術用語に置き換えると、各コンポーネントの実体(<strong>Fiber ノード</strong>)に <strong>フック(Hook)の連結リスト</strong> がぶら下がっており、useState を呼ぶたびにそのリストを1ノードずつ進む仕組みです。
+                  </p>
+
+                  <div className="text-[11px] font-bold text-purple-700 mb-1">📐 実際のデータ構造</div>
+                  <pre className="code-block code-font text-[10px] m-0 p-2 leading-tight mb-2">{`Fiber Node (Appコンポーネントの「実体」)
+  ├ type:           App         ← どの関数コンポーネントか
+  ├ props:          { ... }
+  └ memoizedState:  ─→ Hook { state: 0, next: ─┐
+                                                ↓
+                                Hook { state: false, next: null }
+                                ※ useState の2個目があればここに繋がる
+
+  ロッカー = memoizedState から始まる連結リスト
+  引き出し = 各Hookノード(state を保持)
+  順番    = リストの並び順(呼ばれた順)`}</pre>
+
+                  <div className="text-[11px] font-bold text-purple-700 mb-1">🧪 React 内部の useState(簡略化した擬似コード)</div>
+                  <pre className="code-block code-font text-[10px] m-0 p-2 leading-tight mb-2">{`let currentHook = null;  // 今レンダー中のフックを指すポインタ
+
+function useState(initialValue) {
+  if (currentHook === null) {
+    // 初回マウント時:新しい Hook ノードを作って Fiber に追加
+    currentHook = { state: initialValue, next: null };
+    appendHookToFiber(currentHook);
+  } else {
+    // 再レンダー時:連結リストの次のノードに進む
+    //          ★ initialValue は使わない(無視される)
+    currentHook = currentHook.next;
+  }
+
+  const setState = (newValue) => {
+    currentHook.state = newValue;     // 引き出しに書き込み
+    scheduleRerender();                // 再レンダーを予約
+  };
+
+  return [currentHook.state, setState];
+}`}</pre>
+
+                  <p>
+                    つまり「順番で識別」とは、<strong>連結リストを呼ばれた順に1ノードずつ進める</strong>という意味。<code className="bg-purple-50 px-1 rounded">if</code> や <code className="bg-purple-50 px-1 rounded">for</code> の中で <code className="bg-purple-50 px-1 rounded">useState</code> を呼ぶと、リストの読み取り位置が**1ステップずれて**、過去の値が他の State として返ってくる事故になります。これが <strong>「Rules of Hooks」(フックのルール)</strong> の技術的根拠です。
+                  </p>
+
+                  <p className="mt-2 text-gray-600">
+                    ⚙ <strong>用語整理:</strong><br/>
+                    ・<strong>Fiber</strong> = コンポーネントの「実体」を表す React 内部のオブジェクト。同じ <code className="bg-purple-50 px-1 rounded">{`<App />`}</code> を2箇所に置けば、Fiber も2つ作られ、State も独立する。<br/>
+                    ・<strong>Hook</strong> = Fiber に紐づく State 1つ分の単位。useState・useEffect・useRef などすべてこの連結リストに並ぶ。<br/>
+                    ・<strong>memoizedState</strong> = Hook の先頭ポインタ(React のソースで実際に使われている変数名)。
+                  </p>
+                </div>
               </div>
             </div>
           </div>
@@ -2312,11 +2755,11 @@ React:「中身があるから引数の 0 は無視!」
                   </div>
                   <div className="bg-white border border-amber-200 rounded p-2">
                     <div className="font-bold text-amber-700 mb-1">⚡ Virtual DOM(JSの世界)</div>
-                    <p className="text-gray-700"><code className="bg-amber-50 px-1 rounded">{`{ type, props, ... }`}</code> のただのオブジェクト。<strong>比較は超速い</strong>(JS でメモリ上の比較なので)。</p>
+                    <p className="text-gray-700"><code className="bg-amber-50 px-1 rounded">{`{ type, props, ... }`}</code> のただのオブジェクト。<strong>比較しても再描画/レイアウト計算は走らない</strong>(メモリ上の JS オブジェクト同士の比較なので、実DOMを丸ごと書き換えるより安く済む)。</p>
                   </div>
                 </div>
                 <p className="text-[11px] text-gray-700 mt-2">
-                  <strong>👉 戦略:</strong> 重い実DOMを直接いじる前に、<strong>軽いVirtual DOMで「新旧」を比較</strong>して、必要な変更だけリストアップ。あとはそれを実DOMに当てる(⑤)。
+                  <strong>👉 戦略:</strong> 「JSが実DOMより速い」というより、<strong>毎回ぜんぶ書き換えると再描画・レイアウト計算のコストが嵩む</strong>ので、まず Virtual DOM で「新旧」を比較して<strong>必要な変更だけリストアップ</strong>し、実DOM 操作を最小限に絞る。あとはそれを実DOMに当てる(⑤)。
                 </p>
               </div>
 
@@ -2377,6 +2820,13 @@ React:「中身があるから引数の 0 は無視!」
           <p className="text-xs mt-2">
             これを <strong>バッチ処理</strong>と呼びます。3回 setXxx を呼んでも、画面の作り直しは1回だけ → 効率的。
           </p>
+          <div className="bg-blue-50 border-2 border-blue-200 rounded-lg p-3 mt-2 text-xs text-gray-700">
+            <div className="font-bold text-blue-700 mb-1">📘 補足:Automatic Batching(React 18 〜)</div>
+            <p className="leading-relaxed">
+              React 17 までは <code className="bg-white px-1 rounded">setTimeout</code> や <code className="bg-white px-1 rounded">Promise</code>(<code className="bg-white px-1 rounded">await</code>/<code className="bg-white px-1 rounded">.then</code>)の中で <code className="bg-white px-1 rounded">setState</code> を呼ぶと<strong>バッチされず複数回再レンダリング</strong>されることがありました。<br/>
+              React 18 からは <strong>Automatic Batching</strong> が入って、どこから呼んでも自動でまとめてくれます(=この勉強会では React 18 を使っているので意識不要)。
+            </p>
+          </div>
         </div>
 
         <div className="bg-white border-2 border-yellow-200 rounded-xl p-4 text-sm text-gray-700 mt-4">
@@ -2402,7 +2852,10 @@ React:「中身があるから引数の 0 は無視!」
         </div>
 
         {/* 再レンダリングをもっと深く */}
-        <h3 className="font-extrabold text-amber-700 mt-6 mb-2">🔬 再レンダリングをもっと深く</h3>
+        <div className="bg-amber-50 border-2 border-amber-300 rounded-full px-4 py-1 inline-block text-xs font-bold text-amber-700 mb-2 mt-6">
+          📖 詳しく知りたい人へ(当日はスキップ)
+        </div>
+        <h3 className="font-extrabold text-amber-700 mt-2 mb-2">🔬 再レンダリングをもっと深く</h3>
 
         <div className="bg-white border-2 border-yellow-200 rounded-xl p-4 mb-3">
           <div className="text-xs font-bold text-amber-700 mb-1">① いつ再レンダリングが起きるの?</div>
@@ -2830,6 +3283,9 @@ button10.addEventListener(...)`}</pre>
                 ・onClick だけじゃなく <strong>onChange / onMouseOver なども同じ付箋の中</strong> にまとめて書ける
               </div>
 
+              <div className="bg-amber-50 border-2 border-amber-300 rounded-full px-4 py-1 inline-block text-xs font-bold text-amber-700 mb-2 mt-2">
+                📖 詳しく知りたい人へ(当日はスキップ)
+              </div>
               <div className="bg-white border-2 border-purple-200 rounded-lg p-2 mt-2 text-[11px] text-gray-700">
                 <strong className="text-purple-700">🔬 自分の目で確かめてみる(3ステップ)</strong><br/>
 
@@ -2874,22 +3330,21 @@ button10.addEventListener(...)`}</pre>
                 この <code className="bg-white px-1 rounded">e</code> は、ブラウザがくれた<strong>生のイベントそのもの</strong>ではなく、React が一度<strong>包み直したオブジェクト</strong>です。これを <strong>SyntheticEvent(合成イベント)</strong> と呼びます。
               </p>
 
-              <div className="text-[11px] font-bold text-pink-700 mb-1 mt-3">🤔 なぜわざわざ包む?</div>
+              <div className="bg-amber-50 border-2 border-amber-300 rounded-full px-4 py-1 inline-block text-xs font-bold text-amber-700 mb-2 mt-3">
+                📖 詳しく知りたい人へ(当日はスキップ)
+              </div>
+              <div className="text-[11px] font-bold text-pink-700 mb-1 mt-2">🤔 なぜわざわざ包む?</div>
               <p className="text-[11px] text-gray-700 mb-2">
-                同じ「クリック」でも、<strong>ブラウザによって細かいAPIが違う</strong>からです。
+                理由は主に次の3つです:
               </p>
-              <pre className="code-block code-font text-[10px] m-0 p-2 leading-tight mb-2">{`例: クリックされた要素を取りたい
-
-   モダンブラウザ : event.target
-   古いIE         : event.srcElement   ← 名前ちがう!
-
-例: ブラウザのデフォルト動作を止めたい
-
-   モダンブラウザ : event.preventDefault()
-   古いIE         : event.returnValue = false`}</pre>
-              <p className="text-[11px] text-gray-700 mb-2">
-                React は<strong>すべての差を吸収して統一インターフェースに変換</strong>してから渡してくれる。あなたは1種類の書き方を覚えるだけで OK。
-              </p>
+              <ul className="text-[11px] text-gray-700 space-y-1 mb-2 pl-2">
+                <li className="flex gap-2"><span className="text-pink-600 font-bold">(1)</span><span><strong>ブラウザ間の細かい挙動差を吸収</strong>:同じイベントでもブラウザごとに微妙にプロパティや挙動が違うので、Reactが統一インターフェースに揃えてくれる。</span></li>
+                <li className="flex gap-2"><span className="text-pink-600 font-bold">(2)</span><span><strong>Reactのバブリング/委譲システムに統合</strong>:Reactはイベントを root にまとめて受けて、内部のツリーに沿って伝播させる。SyntheticEvent はその仕組みの上で動くように作られている。</span></li>
+                <li className="flex gap-2"><span className="text-pink-600 font-bold">(3)</span><span><strong>onChange のような React 流の追加機能を提供</strong>:たとえば <code className="bg-white px-1 rounded">onChange</code> はネイティブの change と挙動が違い、React が使いやすい方に揃えてくれる。</span></li>
+              </ul>
+              <div className="bg-white border border-pink-200 rounded-lg p-2 text-[11px] text-gray-700 mb-2">
+                <strong className="text-pink-700">⏳ 昔話(知らなくてOK):</strong> React 16 までは SyntheticEvent が<strong>プール</strong>されて使い回されていたため、非同期(<code className="bg-pink-50 px-1 rounded">setTimeout</code> の中など)で <code className="bg-pink-50 px-1 rounded">e</code> を参照すると中身が消えていて壊れる事故がありました。<strong>React 17 でプーリングは撤廃</strong>されたので、今はネイティブイベントと同じ感覚で扱えます。
+              </div>
 
               <div className="text-[11px] font-bold text-pink-700 mb-1 mt-3">🛠 よく使う3つ(参考)</div>
               <div className="bg-white border border-pink-200 rounded-lg p-2 text-[11px] text-gray-700 space-y-2">
@@ -3155,105 +3610,70 @@ function Fin({ navigate }) {
 // ===========================
 const SPEAKER_NOTES = {
   "/": [
-    "🎤 みなさん、こんにちは。今日は『はじめてのReact』というテーマで、30分の勉強会をします。",
-    "🎤 先週、髙垣さんから『Reactはなぜ人気か』という素敵な発表があったので、今日はそれを踏まえて、Reactの『中で何が起きているのか』『どうやって使うのか』を中心に、実際にコードを触りながら見ていきます。",
-    "🎤 前半20分が説明、後半10分はみんなで手を動かすハンズオンという構成です。",
-    "🎤 それでははじめます。『はじめる』ボタンを押します。",
-    "⏱ 目安: 30秒",
+    `🏠 Home:30秒
+🎤 みなさんこんにちは。今日は「はじめてのReact」、30分の勉強会です。
+🎤 先週の髙垣さんの「Reactはなぜ人気か」を踏まえて、今日は「中で何が起きてるか」「どう使うか」を、コードを触りながら見ます。
+🎤 前半20分が説明、後半10分はハンズオン。
+🖱 Home の小さな🌱で「💧 水をあげる」を1〜2回押して、🌱→🌿→🌷をチラ見せ。「ボタンを押したら絵が変わる」、たったこれだけにReactのしくみが全部詰まっています。
+🎤 では「💭 なんで動くんだろう?」へ。
+
+⏱ 目安: 30秒`,
   ],
   "/how": [
-    "🎤 ここからが今日のメイン、Reactのしくみです。『魔法じゃない、なんで動いているの?』を一緒に追っていきます。",
-    "─ DOMってなに? (2分) ─",
-    "🎤 Reactの話の前に、DOMという言葉が何度か出てくるので、まずそこから整理します。",
-    "🎤 HTMLに <h1>Hello</h1> と書いてあるとき、JavaScriptで document.querySelector('h1').textContent = 'こんにちは!' と書くと、画面の文字が変わります。",
-    "🎤 このときJSが触っているのが『DOM』。ブラウザの中にある、JSが書き換えできる画面の中身データのことです。",
-    "🎤 HTMLはただのテキスト。ブラウザがそれを読み込んで、JSから操作できる形にしたものがDOM。ツリー型なのは、HTMLが入れ子になっているから。",
-    "─ JSXってなに? (2分) ─",
-    "🎤 では本題のJSX。Reactのコードに出てくる <h1>こんにちは</h1> みたいな書き方、これがJSXです。",
-    "🎤 3つだけ覚えてください。①JavaScriptの中にHTMLっぽく書ける構文 ②ブラウザはJSXを直接読めない ③変換後の正体は React.createElement() という関数呼び出しだけ。",
-    "🎤 つまりJSXは『JavaScriptで画面を書きやすくするための糖衣構文』にすぎない、ということです。",
-    "─ Babelってなに? (1分30秒) ─",
-    "🎤 さっき2つめで言った『JSXを変換する誰か』、それがBabelです。",
-    "🎤 JSコードを別のJSコードに変換するツール。Reactの場合、JSXをブラウザが読めるJSに翻訳する『翻訳者』みたいな存在。",
-    "🎤 npmで配布されてるOSSで、Viteなどが内部で勝手に使ってくれます。自分で意識する必要はほぼないです。",
-    "🎤 (時間あれば) ライブのJSX変換器で一個書き換えてみる。",
-    "─ 5ステップの旅 (5分) ─",
-    "🎤 ここまでをふまえて、JSXがブラウザに表示されるまでの5ステップを順番に見ます。",
-    "🎤 ①書く: あなたが <h1>🌷こんにちは</h1> と書く。",
-    "🎤 ②Babelがビルド時に変換: React.createElement('h1', null, '🌷こんにちは') という形になる。",
-    "🎤 ③JSが実行されてオブジェクトになる: { type: 'h1', props: { children: '🌷こんにちは' } }。これを React Element と呼びます。設計図みたいなただのオブジェクトです。",
-    "🎤 ④ReactDOMが実DOMを作る: 裏では document.createElement('h1') という普通のDOM APIを呼んでるだけ。魔法はないです。",
-    "🎤 ⑤ブラウザに表示される。",
-    "🎤 まとめると JSX → 関数呼び出し → オブジェクト → DOM操作 → 表示。これがReactの動きの全部です。",
-    "─ コンポーネント (1分30秒) ─",
-    "🎤 HTMLタグの話でした。Reactでは『自分で作ったタグ』も使えます。それがコンポーネント。",
-    "🎤 大文字始まりは関数として呼ばれる、小文字はHTML要素として扱われる、というルール。",
-    "🎤 <Tulip stage='🌷' /> は React.createElement(Tulip, { stage: '🌷' }) になります。Tulipという関数を呼んで、返ってきたJSXが画面になる、ということです。",
-    "─ State変更 (2分) ─",
-    "🎤 ここまでは『初回表示』の話。次は『画面が変わる時』。",
-    "🎤 setWaterを呼ぶ → Reactが関数を再実行 → 新しい設計図が返る → 前と比較 → 差分だけDOM更新 → 画面に🌿が表示。",
-    "🎤 ポイントは『Stateが変わるたびに、関数コンポーネントはまるごともう一度実行される』。useStateの値が引き継がれるのは、Reactが裏で値を覚えてるからです。",
-    "─ Virtual DOM (30秒) ─",
-    "🎤 ④で出てきた『設計図の比較』が Virtual DOM。実体は『前と新しい、2つのJSオブジェクトを比較してるだけ』。これ知ってると見栄え張れます。",
-    "⏱ 目安: 13〜14分",
+    `🔍 しくみ:14分30秒
+1. Reactってそもそも何?(1分)— JS で書かれたライブラリ、道具
+2. 5ステップの旅 全体像(1分)— ①書く ②Babel変換 ③オブジェクト ④ReactDOM ⑤表示
+3. ①JSX書く(2分)+ ②Babel変換(2分)+ ③React Element(1分30秒)+ ④ReactDOM(2分30秒)+ ⑤表示(20秒)
+4. 🎮 しくみ体感ラボ(1分)— 4段同期エディタで①〜⑤を1装置で連動体験
+5. State って何?(1分)+ State変更時に何が起きてる?(2分30秒)+ イベント裏側(40秒)
+
+🎤 「魔法じゃない、なんで動いているの?」を一緒に追います。
+🎤 鍵は「JSX → 関数呼び出し → オブジェクト → DOM操作 → 表示」と「State が変わると関数まるごと再実行」、この2本。
+🎤 State の値が引き継がれるのは、React が裏に「コンポーネント専用のロッカー」を持ってるから。
+
+★スキップポイント:Tulip変換6ステップ / Fiber 専門解説(ロッカーの裏付け)/ 再レンダリング深掘り / SyntheticEvent の3つの理由 / Console での __reactProps 実験
+
+⏱ 目安: 14〜15分`,
   ],
   "/setup": [
-    "🎤 ここからは自分のPCでReactを動かしたい場合の話。短めに3点。",
-    "─ Viteってなに? (1分) ─",
-    "🎤 Reactで開発するための『便利な土台ツール』がVite。フランス語で『速い』、発音はヴィート。",
-    "🎤 やってくれることは4つ: ①開発サーバ立ち上げ ②JSX→JS翻訳 ③本番ビルド ④プラグイン拡張。",
-    "🎤 ちなみにVueのEvan Youさんが作ったツール。Vue以外でも使えるOSSです。",
-    "─ 始め方 (1分) ─",
-    "🎤 Reactを始めるツールは2つ。Viteはシンプルで学習向き。Next.jsはルーティング・SSRなど全部入りで本番向き。今日のハンズオンはVite想定です。",
-    "─ ビルドって何? (2分) ─",
-    "🎤 『ビルド』はReactコードをブラウザが理解できる形に変換する作業。",
-    "🎤 4つの理由: ①JSXをJSに変換 ②複数ファイルを1つにバンドル ③古いブラウザでも動くように ④本番では圧縮。",
-    "🎤 npm run build すると dist/ に最適化ファイルが出る。GitHub PagesやVercelにアップで公開できる。",
-    "🎤 npm run dev は開発用、npm run build は本番用。",
-    "─ npm run dev で何が起きる (2分) ─",
-    "🎤 一行打つと: ①あなたのPCの中でViteが動き出して、localhost:5173 でアクセスできるようになる。localhost = あなたのPC自身、という意味。",
-    "🎤 ②ブラウザがそのアドレスを開くと index.html が返ってくる。 ③ViteがJSXをJSに翻訳。 ④Reactが <div id='root'> の中に画面を作る。",
-    "🎤 ⑤これがいいんですが、ファイル保存するだけで自動更新。Ctrl+Sだけで反映、リロード要らない。",
-    "⏱ 目安: 5〜6分",
+    `🛠 Setup(余談・時間が余れば):1分
+🎤 最後に余談として、自分のPCでReactを動かしたくなったとき向けに、Vite/ビルド/npm run dev を1ページにまとめてあります。
+🎤 30分枠ではここまでカバーしきれないので、「興味ある人は後で読んでね」と案内するだけでOK。
+🎤 改めて、お疲れさまでした!
+
+⏱ 目安: 1分(時間が余ったときだけ)`,
   ],
   "/try": [
-    "🎤 ここからハンズオン。チューリップを育てるアプリで、Reactのしくみを『体感』してもらいます。",
-    "─ まず動かす (1分) ─",
-    "🎤 下のサンドボックスがエディタ。左にコード、右にプレビュー。まず『水をあげる』ボタンを6回押して、🌱→🌿→🌷の成長を確認してください。",
-    "🎤 (重要) みんな、F12キーを押して開発者ツールを開いてください。コンソールタブを見られる状態に。これからずっと使います。",
-    "─ 体感① 関数の再実行 (2分) ─",
-    "🎤 App関数の中に console.log('🎬 App関数が実行された!') を仕込んでみて。",
-    "🎤 ボタンを押すたびにコンソールに『🎬 App関数が実行された!』が出るはず。",
-    "🎤 これが『Stateが変わると関数がまるごと再実行される』ということ。しくみで言ったやつが、目の前で起きてます。",
-    "─ 体感② React Element の正体 (2分) ─",
-    "🎤 次は console.log('React Element:', <h1>こんにちは</h1>) と書いてみて。",
-    "🎤 コンソールに { type: 'h1', props: {...} } というオブジェクトが出るはず。",
-    "🎤 これが React Element の正体。『JSXはただのオブジェクト』というのが、文字通り見える瞬間です。",
-    "─ 体感③ State が保持される (1分) ─",
-    "🎤 console.log('今の water:', water) を入れて、ボタン押すたびに値を観察。",
-    "🎤 関数は毎回最初から実行されているのに useState(0) の値は引き継がれてる。これが『Reactが裏で値を覚えてくれてる』ということ。",
-    "─ 体感④ コンポーネント分割 (3分) ─",
-    "🎤 Tulipコンポーネントを別に作って、Propsで stage を渡し、3つ並べる例があります。コピペしてもらってOK。",
-    "🎤 <Tulip /> を3つ書いただけで、Tulip関数が3回呼ばれて3つの🌷が表示される。",
-    "🎤 コンポーネントは『関数を呼ぶショートカット』、それだけ、というのが体感できる。",
-    "─ 体感⑤ (発展) JSXなしで書く (1分) ─",
-    "🎤 余裕があれば、JSXなしで React.createElement だけで書き直してみて。",
-    "🎤 JSXのありがたみが身に染みます。",
-    "─ 困った人へ ─",
-    "🎤 リセットボタンで元に戻せます。何度でもチャレンジOK。",
-    "🎤 質問あれば手挙げてください。",
-    "⏱ 目安: 10分",
+    `🌷 見る・体験する(Try):10分
+🎤 ここからは、しくみページで説明したことが実際にどう動くか、手で動かして体験するコーナー。
+🎤 サンドボックス: 左にコード、右にプレビュー、下に CONSOLE。初期は useState(6) で🌷が咲いた状態。
+🎤 (重要)F12 で開発者ツールを開いて。Elements と Console を使います。↻ リセットで何度でもやり直せます。
+
+▸ チャレンジ①「Babel変換」をみる(2分):JSX 版と createElement 版が同じ動きをすること、console.log(jsx) で React Element がオブジェクトとして見える瞬間。
+▸ チャレンジ②「DOM変換」をみる + onClick の謎(4分):Elements で書き換え箇所がハイライト → onclick 属性が無い → イベント委譲 → バブリング → 付箋(__reactProps)→ SyntheticEvent。
+▸ チャレンジ③「State変更で再描画」をみる(2分30秒):実験1〜4。一押しは実験2(setWater 直後の water は古い)と実験4(関数型更新で +3 にできる)。
+▸ チャレンジ④(おまけ)コンポーネント分割(1分):<Tulip stage={...} /> を3つ並べる。Props を渡す唯一の場面。
+
+★スキップポイント:Console での __reactProps 実験 / SyntheticEvent の3つの理由
+
+⏱ 目安: 10分`,
   ],
   "/fin": [
-    "🎤 30分、お疲れさまでした!",
-    "🎤 今日見てきたのは、しくみ・導入・ハンズオンの3つ。",
-    "🎤 持ち帰ってほしい4つのポイント:",
-    "🎤 ① JSXは React.createElement() の書きやすい書き方。",
-    "🎤 ② React Element は『ただのJavaScriptオブジェクト』。",
-    "🎤 ③ DOM操作は React が自動でやる。あなたは Stateを変えるだけ。",
-    "🎤 ④ State が変わると関数がもう一度実行される。",
-    "🎤 質問・感想あればぜひシェアしてください。ご清聴ありがとうございました!",
-    "⏱ 目安: 1分",
+    `📚 まとめ(Fin):4分
+🎤 30分、お疲れさまでした。
+🎤 今日見てきたのは2つ。「しくみ」と「State」。
+🎤 しくみ:JSX → Babel変換 → JS実行でオブジェクト(React Element)→ ReactDOM が実DOM作る → 表示。魔法じゃない5ステップの旅。
+🎤 State:コンポーネントが持つ「変化する値」。useState で作る。変わると関数まるごと再実行+自動再描画。裏のロッカーが値を覚える。
+
+持ち帰る4つ:
+① JSX は React.createElement() の書きやすい書き方
+② React Element は「ただの JS オブジェクト」
+③ DOM 操作は React が自動。あなたは State を変えるだけ
+④ State が変わると関数がもう一度実行される
+
+🎤 質疑応答 → 質問・感想シェア。ご清聴ありがとうございました!
+
+⏱ 目安: 4分(うち質疑応答)`,
   ],
 };
 
@@ -3274,7 +3694,7 @@ function NotesPanel({ open, onClose, path }) {
               {notes.map((n, i) => (
                 <li key={i} className="flex gap-2">
                   <span className="text-orange-500 font-extrabold shrink-0">▸</span>
-                  <span>{n}</span>
+                  <span className="whitespace-pre-line">{n}</span>
                 </li>
               ))}
             </ul>
